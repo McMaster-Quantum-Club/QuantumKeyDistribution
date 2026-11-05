@@ -8,6 +8,11 @@
 #define QBER 0.11f
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
+// sifting.c is compiled as C; this lets C++ (.ino) files link against it.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 
 typedef struct __attribute__((packed)) Basis {
   uint8_t b1; //0 = 0 degrees 1 = 90 degrees
@@ -60,5 +65,8 @@ bool computeQBER(
 // Returns new key length, or -1 if keyLen is not 0..N_SLOTS
 int removeSample(uint8_t key[], int keyLen, const int sampleIdx[], int sampleLen);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif
