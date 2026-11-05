@@ -1,0 +1,313 @@
+ALICE AND BOB (BB84 QKD) TEST PLAN
+==================================
+
+Document date:  2026-11-05
+System:         Sender.ino (Alice), Reciever.ino (Bob), sifting.c / sifting.h
+Status:         Draft. Covers the code as of 2026-11-05 (see changes.md)
+
+
+1. PURPOSE
+----------
+This plan checks that the Alice and Bob ESP32 system:
+  - sends Alice's bases and bitstring to Bob over ESP-NOW,
+  - rejects packets of the wrong size,
+  - sifts the key correctly (keeps only detected slots where the bases match),
+  - samples the sifted key and computes the QBER correctly,
+  - accepts or rejects the key against the 11% QBER threshold.
+
+
+2. SCOPE
+--------
+In scope:
+  - Host unit tests of the sifting library (sifting.c).
+  - Compilation of both sketches for ESP32.
+  - Two-board ESP-NOW transfer between Alice and Bob.
+  - Bob's sifting and QBER output for set test inputs.
+
+Out of scope (not implemented yet):
+  - Optical hardware: plate rotation, photon detection, timing slots.
+  - Bob sending his bases back to Alice, and Alice-side sifting.
+  - Error correction and privacy amplification.
+  - Security against a real eavesdropper. Eavesdropping is only simulated,
+    by injecting bit errors (Section 7.4).
+
+
+3. TEST ENVIRONMENT
+-------------------
+Hardware:
+  - 2x ESP32 dev boards (FQBN esp32:esp32:esp32).
+    The receiver (Bob) must have MAC A4:F0:0F:68:B9:00, or broadcastAddress
+    in Sender.ino must be changed to match.
+  - 2x USB cables. Ideally use one PC with two serial ports.
+
+Software:
+  - Arduino ESP32 core 3.3.12 (Arduino IDE 2.x or arduino-cli).
+  - A host C compiler (gcc) for the unit tests.
+  - Serial monitor at 115200 baud for each board.
+
+Sketch layout (required by the Arduino IDE):
+  Sender/Sender.ino      + sifting.c + sifting.h
+  Reciever/Reciever.ino  + sifting.c + sifting.h
+
+Baseline configuration (unless a test says otherwise):
+  - Sender.ino    send_bases(): every bitstring bit = 0, every basis = 00
+  - Reciever.ino  bob_measure(): basis 00, detected = true,
+                  bob_raw[j] = myData.bitstring[j]
+  - Reciever.ino  SAMPLE_FRACTION = 0.25f
+  - sifting.h     N_SLOTS = 32, QBER = 0.11f
+
+
+4. TEST LEVELS
+--------------
+  Level 1  Unit tests      sifting.c on the host PC, no hardware needed
+  Level 2  Build tests     both sketches compile for ESP32
+  Level 3  Link tests      ESP-NOW transfer between the two boards
+  Level 4  System tests    full Alice -> Bob run with set sifting/QBER cases
+  Level 5  Robustness      bad packets, start-up order, repeat runs
+
+Run the levels in order. Do not start a level until the one before passes.
+
+
+5. LEVEL 1: UNIT TESTS
+----------------------
+UT-01  Sifting library unit tests
+  Procedure:
+    gcc -Wall -Wextra -o test_sifting sifting_test.c sifting.c
+    ./test_sifting
+  Expected:
+    - Builds with no errors or warnings.
+    - Every test prints [PASS].
+    - Last line: "<N> checks, 0 failed". On 2026-11-05: 1268 checks, 0 failed.
+    - Exit code 0.
+  Covers: basesFilterKey, pickSample, computeQBER, removeSample, including
+          edge cases (empty sample, exactly 11%, invalid lengths).
+
+
+6. LEVEL 2: BUILD TESTS
+-----------------------
+BT-01  Compile Alice
+  Procedure:  arduino-cli compile --fqbn esp32:esp32:esp32 --warnings default Sender
+  Expected:   Compiles with no errors or warnings.
+
+BT-02  Compile Bob
+  Procedure:  arduino-cli compile --fqbn esp32:esp32:esp32 --warnings default Reciever
+  Expected:   Compiles with no errors or warnings. In particular, there is no
+              "undefined reference" to sifting functions, which would mean the
+              extern "C" guards are missing.
+
+
+7. LEVELS 3-4: LINK AND SYSTEM TESTS
+------------------------------------
+General procedure for each test in this section:
+  1. Make the configuration changes the test lists, starting from the baseline.
+  2. Flash both boards.
+  3. Open both serial monitors.
+  4. Reset Bob and wait until it prints "World." (Bob is now listening).
+  5. Reset Alice.
+  6. Record both serial logs and compare them with the expected results.
+  7. Put the configuration back to the baseline.
+
+Note: start Bob first in every test. Alice sends only once, with no retry
+(known issue K1).
+
+
+7.1 Link tests
+--------------
+LT-01  Packet delivery
+  Config:   Baseline.
+  Expected on Alice:
+    - Prints slot numbers 0 to 31.
+    - "Sent Alice's Bases with success!"
+    - "Last Packet Send Status: Delivery Success"
+  Expected on Bob:
+    - "RECEIVED CALLBACK TRIGGERED"
+    - "Bytes received: 96"
+
+LT-02  Payload integrity
+  Config:   Alice send_bases():
+              bitstring[j] = j % 2
+              bases[j].b1  = (j / 2) % 2
+              bases[j].b2  = 0
+  Expected on Bob:
+    - "Bitstring: 01010101010101010101010101010101"
+    - "Basis: 00 00 10 10 00 00 10 10 ..." (the pattern repeats every 4 slots)
+  Pass if: Bob's printed bitstring and bases match what Alice set, bit for bit.
+
+LT-03  Wrong receiver MAC
+  Config:   Change one byte of broadcastAddress in Sender.ino.
+  Expected:
+    - Alice prints "Delivery Fail".
+    - Bob prints nothing.
+
+
+7.2 Sifting tests (bases)
+-------------------------
+ST-01  All bases match (ideal case)
+  Config:   Baseline.
+  Expected on Bob:
+    - "Sifted key (Bob):   000...0 (32 bits)"
+    - Sample of 8 positions (32 x 0.25 = 8), all unique, each in the range 0-31.
+    - "Errors in sample:   0/8"
+    - "QBER:               0.00% (threshold 11%)"
+    - "Result: below threshold, key accepted"
+
+ST-02  No bases match
+  Config:   Alice send_bases(): bases[j].b1 = 1 for every slot.
+  Expected on Bob:
+    - "Sifted key (Bob):    (0 bits)"
+    - "No matching bases; nothing to sample."
+    - No QBER line.
+
+ST-03  Half the bases match
+  Config:   Alice send_bases(): bases[j].b1 = j % 2.
+            Bob bob_measure(): unchanged (basis 00).
+  Expected on Bob:
+    - Sifted key of 16 bits (the even slots only).
+    - Sample of 4 positions.
+    - "Errors in sample:   0/4", key accepted.
+
+ST-04  Sifted key keeps the right bits
+  Config:   Alice send_bases():
+              bitstring[j] = (j < 16) ? 1 : 0
+              bases[j].b1  = (j % 4 == 0) ? 0 : 1
+  Expected on Bob:
+    - Kept slots are 0, 4, 8, 12, 16, 20, 24 and 28.
+    - "Sifted key (Bob):   11110000 (8 bits)"
+    - Sample of 2 positions, 0 errors.
+
+
+7.3 Detection tests
+-------------------
+DT-01  Missed detections are dropped
+  Config:   Bob bob_measure(): bob_detected[j] = false for j = 5, 6 and 20.
+  Expected on Bob:
+    - Sifted key of 29 bits.
+    - Sample of 7 positions (29 x 0.25 = 7.25, which rounds to 7).
+    - 0 errors, key accepted.
+
+DT-02  Nothing detected
+  Config:   Bob bob_measure(): bob_detected[j] = false for every slot.
+  Expected on Bob:
+    - "No matching bases; nothing to sample."
+
+
+7.4 QBER tests (simulated channel errors / eavesdropper)
+--------------------------------------------------------
+For these tests set SAMPLE_FRACTION = 1.0f in Reciever.ino. The whole sifted
+key is then revealed, so the results don't depend on which positions the
+random sample picks.
+
+QT-01  No errors
+  Config:   Baseline, plus SAMPLE_FRACTION = 1.0f.
+  Expected: "Errors in sample:   0/32", "QBER: 0.00%", key accepted.
+
+QT-02  Error rate below the threshold
+  Config:   Bob bob_measure(): bob_raw[j] = !myData.bitstring[j] for j = 0, 1, 2
+            (3 flipped bits).
+  Expected: "Errors in sample:   3/32", "QBER: 9.38%", key accepted.
+
+QT-03  Error rate above the threshold
+  Config:   As QT-02, but flip j = 0, 1, 2, 3 (4 flipped bits).
+  Expected: "Errors in sample:   4/32", "QBER: 12.50%", key rejected.
+
+QT-04  Every bit wrong
+  Config:   Bob bob_measure(): bob_raw[j] = !myData.bitstring[j] for every slot.
+  Expected: "Errors in sample:   32/32", "QBER: 100.00%", key rejected.
+
+QT-05  Partial sample (default fraction)
+  Config:   As QT-04, but SAMPLE_FRACTION back to 0.25f.
+  Expected: "Errors in sample:   8/8", "QBER: 100.00%", key rejected.
+
+Note: a QBER of exactly 11% can't happen with 32 slots. That boundary (the
+key is rejected at exactly 11%) is covered by UT-01
+(test_computeQBER_exactlyAtThreshold).
+
+
+8. LEVEL 5: ROBUSTNESS TESTS
+----------------------------
+RT-01  Packet size guard
+  Config:   Add one extra field to struct_message in Sender.ino only
+            (for example "uint8_t pad;").
+  Expected on Bob:
+    - "Unexpected packet size: 97 (expected 96)"
+    - No Bytes/Bitstring/Basis output, and no sifting.
+  Afterwards: remove the extra field.
+
+RT-02  Bob started after Alice
+  Config:   Baseline. Reset Alice first, then reset Bob.
+  Expected (current behaviour, known issue K1):
+    - Alice prints "Delivery Fail".
+    - Bob never sifts.
+  Pass if: the behaviour matches this description. When K1 is fixed, change
+  the expected result to "Bob receives the packet and sifts".
+
+RT-03  Random sample changes between boots
+  Config:   Baseline. Run ST-01 three times, resetting both boards each time.
+  Record:   the "Sample positions" line from each run.
+  Expected once known issue K3 is fixed: the positions differ between runs.
+  Current behaviour: the positions may be the same every run. Record and
+  report this; it is not a pass.
+
+RT-04  Repeated sessions
+  Config:   Baseline. Reset Alice 10 times while Bob keeps running.
+  Expected: Bob receives and sifts once per Alice reset (10 times in total),
+            with no crashes or reboots.
+
+RT-05  Soak test
+  Config:   Baseline. Leave both boards running for at least 8 hours after
+            one session.
+  Expected: Neither board crashes or reboots, and Alice sends no extra
+            packets. Note that the counter i overflows (known issue K4).
+
+
+9. KNOWN ISSUES THAT AFFECT TESTING
+-----------------------------------
+K1  Alice sends once and never retries, so Bob must be listening first.
+K2  rotatePlates() prints "Entire bit string has been sent" on every slot.
+    Ignore these lines when reading Alice's log.
+K3  pickSample seeds with time(NULL), which is about 0 at boot on an ESP32,
+    so the sample positions may repeat across boots.
+K4  The counter i in Sender.ino keeps increasing and eventually overflows.
+K5  Open question: do Basis.b1/b2 mean polarisation states or plate settings?
+    The expected results in Section 7.2 assume the current behaviour: bases
+    match only when both b1 and b2 match.
+
+
+10. PASS / FAIL CRITERIA
+------------------------
+  - A test passes only if every expected result is seen.
+  - Any crash, reboot, garbled output or hang is a failure.
+  - The system passes if every test in Levels 1-4 passes and every Level 5
+    test either passes or matches the known issue it is linked to.
+  - For every failure, record the test ID, the configuration, both serial logs
+    and the commit hash.
+
+
+11. RESULTS RECORD
+------------------
+Tester:  ______________    Date: __________    Commit: __________
+
+  Test ID  | Result (P/F) | Notes
+  ---------+--------------+------------------------------------------------
+  UT-01    |              |
+  BT-01    |              |
+  BT-02    |              |
+  LT-01    |              |
+  LT-02    |              |
+  LT-03    |              |
+  ST-01    |              |
+  ST-02    |              |
+  ST-03    |              |
+  ST-04    |              |
+  DT-01    |              |
+  DT-02    |              |
+  QT-01    |              |
+  QT-02    |              |
+  QT-03    |              |
+  QT-04    |              |
+  QT-05    |              |
+  RT-01    |              |
+  RT-02    |              |
+  RT-03    |              |
+  RT-04    |              |
+  RT-05    |              |
