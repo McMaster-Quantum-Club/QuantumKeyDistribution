@@ -1,0 +1,141 @@
+#include "esp_adc/adc_continuous.h"
+
+
+	// block 1
+	adc_channel_t channels[2] = {ADC_CHANNEL_0, ADC_CHANNEL_3};
+	int ADC_DATA[2];
+	int voltage[2];
+
+	adc_continuous_handle_t adc_handle;
+	TaskHandle_t cb_task;
+
+	//block 2
+	// notifies cbTask when conv frame is generated
+	static bool IRAM_ATTR callback (adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
+	{
+		BaseType_t mustYield = pdFALSE;
+		vTaskNotifyGiveFromISR(cb_task, &mustYield);
+		return (mustYield == pdTRUE);
+	}
+
+	//block 3
+	// extracts conv frame from buffer, stores in adc_data[channel]
+	// make sure this extraction function is faster than the time taken to generate a conv frame
+	// I think its speed is roughly limited determined by max conv frame generation rate, since overhead seems small?
+	
+
+	//*******Important function
+	void cbTask (void *parameters)
+{
+	uint8_t buf[30]; // buffer is <30> bytes
+	uint32_t rxLen = 0;
+
+	for (;;)
+	{
+		// waits for conv frame to be generated
+		ulTaskNotifyTake(pdTRUE, portMAX_DELAY); 													//how long does the interrupt take once a conv frame is generated?
+
+		// reads from buffer //12 is length of conv result, in bytes
+		adc_continuous_read(adc_handle, buf, 12, &rxLen, 0);
+		for (int i=0; i<rxLen; i+=SOC_ADC_DIGI_RESULT_BYTES)
+		{
+			adc_digi_output_data_t *p = (adc_digi_output_data_t *)&buf[i];
+			uint16_t channel = p->type1.channel;
+			uint16_t data = p->type1.data;
+
+			// store data in adc_data for relevant channels
+			if (channel == ADC_CHANNEL_0) ADC_DATA[0] = data;
+			if (channel == ADC_CHANNEL_3) ADC_DATA[1] = data;								//during the interrupt 
+		}
+	}
+		}
+
+
+	//block 4
+
+	//**** Parameters
+  void ADC_Init (adc_channel_t *channels, uint8_t numChannels)
+{
+	// handle configuration
+	adc_continuous_handle_cfg_t handle_config = {
+		.max_store_buf_size = 24, // pool size is <24> bytes (size of pool, would have 2 conv frames)
+    .conv_frame_size = 12, // conv frame size is <12> bytes (interupt after each frame). on esp32 conv results are <2> bytes
+	};
+	ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_config, &adc_handle));
+	
+	// ADC Configuration with Channels
+	adc_continuous_config_t adc_cnfig = {
+		.pattern_num = numChannels, //we're using 2 channels for continous mode
+    .sample_freq_hz = 20*1000, // find max threshold value (soc/soc_caps.h). sampling freq for conv result (data)
+    .conv_mode = ADC_CONV_SINGLE_UNIT_1, //use only adc1
+    .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1, // type 1 format is {channel,data}. conv results will be 2 bytes (SOC_ADC_DIGI_RESULT_BYTES)
+	};
+
+	adc_digi_pattern_config_t channel_config[2];
+	for (int i=0; i<numChannels; i++)
+		{
+			channel_config[i].channel = channels[i];
+			channel_config[i].atten = ADC_ATTEN_DB_12; //12 dB, allows measurements up to 2.45V
+			channel_config[i].bit_width = ADC_BITWIDTH_12; // 9-13 bit resolution, higher bit resolution means takes longer to "convert the respective channel"
+			channel_config[i].unit = ADC_UNIT_1;
+		}
+	adc_cnfig.adc_pattern = channel_config;
+	ESP_ERROR_CHECK(adc_continuous_config(adc_handle, &adc_cnfig));
+	
+
+	// Block 5
+	// Callback Configuration
+	adc_continuous_evt_cbs_t cb_config = { // when conv frame is done call callback
+		.on_conv_done = callback,
+	};
+
+	ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(adc_handle, &cb_config, NULL));
+}
+
+
+
+
+
+// block 6 was app_main(void), but this is split to setup() and loop() .
+
+void setup() {
+  Serial.begin(115200);
+  xTaskCreate(cbTask, "Callback Task", 4096, NULL, 0, &cb_task);
+  ADC_Init(channels, 2);
+  ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
+}
+
+void loop() {
+  voltage[0] = ADC_DATA[0]*3300/4095;
+  voltage[1] = ADC_DATA[1]*3300/4095;
+  Serial.printf("CH0:%d\t CH3:%d\t mV[0]:%d\t mV[3]:%d\n", ADC_DATA[0], ADC_DATA[1], voltage[0], voltage[1]);
+  vTaskDelay(pdMS_TO_TICKS(100)); // delay by 100ms until printing of next data
+}
+
+
+	
+	
+	
+	
+	
+	// block 6
+	
+	
+//	void app_main(void){
+//	xTaskCreate(cbTask, "Callback Task", 4096, NULL, 0, &cb_task);
+//	ADC_Init(channels, 2);
+//	ESP_ERROR_CHECK(adc_continuous_start(adc_handle));
+//	while (1)
+//			{
+//		voltage[0] = ADC_DATA[0]*3300/4095;
+//		voltage[1] = ADC_DATA[1]*3300/4095;
+//		printf("CH0:%d\t CH3:%d\t mV[0]:%d\t mV[3]:%d\n",ADC_DATA[0], ADC_DATA[1], voltage[0], voltage[1]);
+//		vTaskDelay(pdMS_TO_TICKS(100));
+//			}
+//		
+//		}
+
+
+// these 100ms delays are accurate "within one RTOS tick"
+
+
